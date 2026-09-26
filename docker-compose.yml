@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:latest
@@ -7,9 +5,7 @@ services:
       - stack.env
     volumes:
       - ./data/redis:/data
-    restart: always
-    networks:
-      - internal_network
+    restart: unless-stopped
 
   postgres:
     image: postgres:18
@@ -31,10 +27,6 @@ services:
       - stack.env
     volumes:
       - ./data/telegram:/data
-    restart: always
-    networks:
-      - internal_network
+    restart: unless-stopped
 
-networks:
-  internal_network:
-    driver: bridge
+
