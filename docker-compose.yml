@@ -6,7 +6,7 @@ services:
     env_file: 
       - stack.env
     volumes:
-      - redis-data:/data
+      - ./data/redis:/data
     restart: always
     networks:
       - internal_network
@@ -16,7 +16,7 @@ services:
     env_file: 
       - stack.env
     volumes:
-      - postgresql-data:/var/lib/postgresql
+      - ./data/postgres:/var/lib/postgresql
     restart: always
     networks:
       - internal_network
@@ -30,15 +30,10 @@ services:
     env_file: 
       - stack.env
     volumes:
-      - telegram-session:/data
+      - ./data/telegram:/data
     restart: always
     networks:
       - internal_network
-
-volumes:
-  redis-data:
-  postgresql-data:
-  telegram-session:
 
 networks:
   internal_network:
