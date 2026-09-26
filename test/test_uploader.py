@@ -418,3 +418,22 @@ async def test_caption_failure_does_not_resend_media_group(monkeypatch):
 
     message.reply_media_group.assert_awaited_once()
     assert captions["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_keeps_distinct_urls_from_same_message(monkeypatch):
+    """同一条消息里的多个不同链接都要入队，只有同内容才算重复"""
+    _patch_queue(monkeypatch, ([], None))
+    manager = _telegram_manager(monkeypatch)
+
+    first_url = "https://www.bilibili.com/video/av1"
+    second_url = "https://www.bilibili.com/video/av2"
+    first = _telegram_task(_fake_message(), first_url)
+    second = _telegram_task(_fake_message(), second_url)
+    first.urls = second.urls = [first_url, second_url]
+
+    await manager.submit(first)
+    await manager.submit(second)
+    await manager.submit(_telegram_task(_fake_message(), first_url))
+
+    assert [t.parsed_content.url for t in manager.active_tasks[1].values()] == [first_url, second_url]

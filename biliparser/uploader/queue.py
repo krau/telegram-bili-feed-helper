@@ -134,7 +134,8 @@ class UploadQueueManager(ABC):
                 logger.warning(f"用户 {task.user_id} 的任务数已达上限 ({self.max_user_tasks})，丢弃新任务")
                 return
             for existing_task in user_tasks.values():
-                if existing_task.urls == task.urls:
+                # 按解析结果判重：同一条消息里的不同链接不能互相误判为重复
+                if existing_task.parsed_content.url == task.parsed_content.url:
                     logger.info(f"用户 {task.user_id} 提交了重复的任务，忽略")
                     return
             self.active_tasks[task.user_id][task.task_id] = task
