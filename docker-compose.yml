@@ -21,27 +21,16 @@ services:
     networks:
       - internal_network
 
-  telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
-    env_file: 
-      - stack.env
-    volumes:
-      - telegram-bot-api-data:/var/lib/telegram-bot-api
-    restart: always
-    networks:
-      - internal_network
-
   telegram-bili-feed-helper:
     # 由本仓库 Actions 构建并发布到仓库所属账号
     image: ghcr.io/krau/telegram-bili-feed-helper:master
     depends_on:
       - redis
       - postgres
-      - telegram-bot-api
     env_file: 
       - stack.env
     volumes:
-      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - telegram-session:/data
     restart: always
     networks:
       - internal_network
@@ -49,7 +38,7 @@ services:
 volumes:
   redis-data:
   postgresql-data:
-  telegram-bot-api-data:
+  telegram-session:
 
 networks:
   internal_network:
