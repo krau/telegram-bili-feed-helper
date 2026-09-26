@@ -19,7 +19,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 from ...model import ParsedContent
 from ...storage.models import TelegramFileCache
 from ...uploader.download import cleanup_medias
-from ...uploader.queue import UploadPhase, UploadQueueManager, UploadTask
+from ...uploader.queue import MediaUnavailable, UploadPhase, UploadQueueManager, UploadTask
 from ...utils import logger
 from .formatting import format_caption_for_telegram
 
@@ -185,12 +185,10 @@ class TelegramUploadQueueManager(UploadQueueManager):
         media = task.media
         mediathumb = task.mediathumb
 
-        caption = format_caption_for_telegram(f, self.constraints)
-
         if not media or not f.media or not message:
-            if message:
-                await message.reply_text(caption)
-            return None
+            raise MediaUnavailable(f"媒体为空，无法发送: {f.url}")
+
+        caption = format_caption_for_telegram(f, self.constraints)
 
         if f.media.type == "video":
             result = await message.reply_video(

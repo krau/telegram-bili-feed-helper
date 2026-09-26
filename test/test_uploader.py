@@ -322,6 +322,24 @@ def _telegram_task(message, url, media=None, task_type="parse", fetch_mode=None)
 
 
 @pytest.mark.asyncio
+async def test_empty_media_is_not_sent_as_text(monkeypatch):
+    """解析类任务媒体准备失败时不得静默降级为纯文本"""
+    from biliparser.uploader.queue import UploadResult
+
+    message = _fake_message()
+    media = MediaInfo(urls=["https://cdn.invalid/v.m4s", "https://cdn.invalid/a.m4s"], type="video", merge_streams=True)
+    task = _telegram_task(message, "https://www.bilibili.com/video/av1", media=media)
+    _patch_queue(monkeypatch, ([], "cover.jpg"))
+    manager = _telegram_manager(monkeypatch)
+
+    result = await manager._try_upload_once(task, 1, 1)
+
+    assert result is UploadResult.RETRY
+    message.reply_text.assert_not_awaited()
+    message.reply_video.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_timeout_is_not_retried(monkeypatch):
     """发送结果未知（超时）时不得重发，只通知用户"""
     from telegram.error import TimedOut

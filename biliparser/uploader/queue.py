@@ -54,6 +54,10 @@ class UploadResult(Enum):
     GIVE_UP = "give_up"
 
 
+class MediaUnavailable(Exception):
+    """媒体准备结束但没有得到任何可用文件"""
+
+
 class UploadQueueManager(ABC):
     """上传队列管理器抽象基类
 
@@ -266,6 +270,9 @@ class UploadQueueManager(ABC):
                 if not media and mediathumb and f.media and f.media.type not in ["video", "audio"]:
                     media = [mediathumb]
                     mediathumb = None  # 已并入 media，避免重复加入 medias
+
+                if not media and not is_fetch_task and f.media and f.media.urls:
+                    raise MediaUnavailable(f"媒体准备失败: {f.url}")
 
                 task.media = media or []
                 task.mediathumb = mediathumb

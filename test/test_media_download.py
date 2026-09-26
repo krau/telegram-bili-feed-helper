@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -111,3 +112,119 @@ async def test_handle_dash_media_cache_lookup_uses_merged_filename():
     assert result == ["cached-file-id"]
     assert content.media.filenames == ["CID-1-30080_merged.mp4"]
     assert content.media.merge_streams is False
+
+
+# ── 下载完整性校验与 MP4 回退 ──────────────────────────────────────────────────
+
+
+class SizedResponse:
+    """按 content-length 返回完整或截断内容"""
+
+    def __init__(self, url, payload, total=None):
+        self.status_code = 200
+        self.headers = {"content-type": "video/mp4", "content-length": str(len(payload) if total is None else total)}
+        self.request = httpx.Request("GET", url)
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def aiter_bytes(self):
+        yield self._payload
+
+
+class FlakyClient:
+    """第一次返回截断内容，之后返回完整内容"""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def stream(self, method, url, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return SizedResponse(url, self.payload[:1024], total=len(self.payload))
+        return SizedResponse(url, self.payload)
+
+
+@pytest.mark.asyncio
+async def test_truncated_download_is_retried_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    payload = b"x" * 4096
+    client = FlakyClient(payload)
+
+    result = await download_module.get_media(
+        client, "https://www.bilibili.com/video/BV1", "https://cdn.invalid/v.mp4", "v.mp4", no_cache=True
+    )
+
+    assert client.calls == 2
+    assert isinstance(result, Path)
+    assert result.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_persistently_truncated_download_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+
+    class AlwaysTruncatedClient(FlakyClient):
+        def stream(self, method, url, **kwargs):
+            self.calls += 1
+            return SizedResponse(url, self.payload[:1024], total=len(self.payload))
+
+    client = AlwaysTruncatedClient(b"x" * 4096)
+
+    result = await download_module.get_media(
+        client, "https://www.bilibili.com/video/BV1", "https://cdn.invalid/v.mp4", "v.mp4", no_cache=True
+    )
+
+    assert client.calls == download_module.MEDIA_DOWNLOAD_ATTEMPTS
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_dash_failure_falls_back_to_mp4_direct_link(monkeypatch, tmp_path):
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    fallback = "https://cdn.invalid/CID-1.mp4"
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV-fallback",
+        author=Author(),
+        media=MediaInfo(
+            urls=["https://cdn.invalid/video.m4s", "https://cdn.invalid/audio.m4s"],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            merge_streams=True,
+            fallback_url=fallback,
+        ),
+    )
+    monkeypatch.setattr(download_module, "handle_dash_media", AsyncMock(return_value=[]))
+    get_media = AsyncMock(return_value=tmp_path / "CID-1.mp4")
+    monkeypatch.setattr(download_module, "get_media", get_media)
+
+    media, _thumb = await download_module.get_media_for_content(content)
+
+    assert media == [tmp_path / "CID-1.mp4"]
+    assert content.media.urls == [fallback]
+    assert content.media.filenames == ["CID-1.mp4"]
+    assert content.media.merge_streams is False
+
+
+@pytest.mark.asyncio
+async def test_dash_failure_without_fallback_yields_no_media(monkeypatch):
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV-no-fallback",
+        author=Author(),
+        media=MediaInfo(
+            urls=["https://cdn.invalid/video.m4s", "https://cdn.invalid/audio.m4s"],
+            type="video",
+            filenames=["video.m4s", "audio.m4s"],
+            merge_streams=True,
+        ),
+    )
+    monkeypatch.setattr(download_module, "handle_dash_media", AsyncMock(return_value=[]))
+
+    media, _thumb = await download_module.get_media_for_content(content)
+
+    assert media == []

@@ -22,12 +22,18 @@ from tqdm import tqdm
 
 from ..model import ParsedContent
 from ..provider.bilibili.api import BILIBILI_DESKTOP_HEADER, CACHES_TIMER, referer_url
-from ..utils import compress, logger
+from ..utils import compress, get_filename, logger
 
 LOCAL_MEDIA_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd()))) / ".tmp"
 LOCAL_MODE = bool(os.environ.get("LOCAL_MODE", False))
 
+MEDIA_DOWNLOAD_ATTEMPTS = 2
+
 CacheLookup = Callable[[str], Coroutine[None, None, str | None]]
+
+
+class IncompleteDownload(Exception):
+    """下载内容少于 content-length（连接被截断）"""
 
 
 def dash_merged_filename(filename: str) -> str:
@@ -53,7 +59,10 @@ async def get_media(
     is_thumbnail: bool = False,
     cache_lookup: CacheLookup | None = None,
 ) -> Path | str | None:
-    """下载单个媒体文件到本地临时目录，返回本地 Path 或缓存 file_id"""
+    """下载单个媒体文件到本地临时目录，返回本地 Path 或缓存 file_id
+
+    校验 content-length，下载被截断时重试 MEDIA_DOWNLOAD_ATTEMPTS 次；仍失败返回 None。
+    """
     if isinstance(url, Path):
         return url
     if not no_cache and cache_lookup is not None:
@@ -64,63 +73,88 @@ async def get_media(
     media = LOCAL_MEDIA_FILE_PATH / filename
     temp_media = LOCAL_MEDIA_FILE_PATH / uuid4().hex
     try:
-        header = BILIBILI_DESKTOP_HEADER.copy()
-        header["Referer"] = referer
-        async with timeout(CACHES_TIMER["LOCK"]), client.stream("GET", url, headers=header) as response:
-            logger.info(f"下载开始: {url}")
-            if response.status_code != 200:
-                raise httpx.HTTPStatusError(
-                    f"媒体文件获取错误: {response.status_code} {url}->{referer}",
-                    request=response.request,
-                    response=response,
+        for attempt in range(1, MEDIA_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                await _download_media_file(
+                    client, referer, url, filename, temp_media, compression, media_check_ignore, is_thumbnail
                 )
-            content_type = response.headers.get("content-type")
-            if content_type is None:
-                raise httpx.HTTPStatusError(
-                    f"媒体文件获取错误: 无法获取 content-type {url}->{referer}",
-                    request=response.request,
-                    response=response,
-                )
-            mediatype = content_type.split("/")
-            total = int(response.headers.get("content-length", 0))
-            if mediatype[0] in ["video", "audio", "application"]:
-                with (
-                    temp_media.open("wb") as file,
-                    tqdm(
-                        total=total,
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        unit="B",
-                        desc=response.request.url.host + "->" + filename,
-                    ) as pbar,
-                ):
-                    async for chunk in response.aiter_bytes():
-                        file.write(chunk)
-                        pbar.update(len(chunk))
-            elif media_check_ignore or mediatype[0] == "image":
-                img = await response.aread()
-                if compression and mediatype[1] in ["jpeg", "png"]:
-                    logger.info(f"压缩: {url} {mediatype[1]}")
-                    if is_thumbnail:
-                        img = compress(BytesIO(img), size=320, format="JPEG").getvalue()
-                    else:
-                        img = compress(BytesIO(img)).getvalue()
-                with temp_media.open("wb") as file:
-                    file.write(img)
-            else:
-                raise ValueError(f"媒体文件类型错误: {mediatype} {url}->{referer}")
+            except asyncio.TimeoutError:
+                logger.error(f"下载超时: {url}->{referer}")
+                raise httpx.TimeoutException(f"下载超时: {url}")
+            except Exception as e:
+                logger.error(f"下载错误 ({attempt}/{MEDIA_DOWNLOAD_ATTEMPTS}): {url}->{referer}")
+                logger.exception(e)
+                continue
             media.unlink(missing_ok=True)
             temp_media.rename(media)
             logger.info(f"完成下载: {media}")
             return media
-    except asyncio.TimeoutError:
-        logger.error(f"下载超时: {url}->{referer}")
-        raise httpx.TimeoutException(f"下载超时: {url}")
-    except Exception as e:
-        logger.error(f"下载错误: {url}->{referer}")
-        logger.exception(e)
+        return None
     finally:
         temp_media.unlink(missing_ok=True)
+
+
+async def _download_media_file(
+    client: httpx.AsyncClient,
+    referer,
+    url: str,
+    filename: str,
+    temp_media: Path,
+    compression: bool = True,
+    media_check_ignore: bool = False,
+    is_thumbnail: bool = False,
+) -> None:
+    """把 url 下载到 temp_media，长度不足 content-length 时抛出 IncompleteDownload"""
+    header = BILIBILI_DESKTOP_HEADER.copy()
+    header["Referer"] = referer
+    async with timeout(CACHES_TIMER["LOCK"]), client.stream("GET", url, headers=header) as response:
+        logger.info(f"下载开始: {url}")
+        if response.status_code != 200:
+            raise httpx.HTTPStatusError(
+                f"媒体文件获取错误: {response.status_code} {url}->{referer}",
+                request=response.request,
+                response=response,
+            )
+        content_type = response.headers.get("content-type")
+        if content_type is None:
+            raise httpx.HTTPStatusError(
+                f"媒体文件获取错误: 无法获取 content-type {url}->{referer}",
+                request=response.request,
+                response=response,
+            )
+        mediatype = content_type.split("/")
+        total = int(response.headers.get("content-length", 0))
+        written = 0
+        if mediatype[0] in ["video", "audio", "application"]:
+            with (
+                temp_media.open("wb") as file,
+                tqdm(
+                    total=total,
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    unit="B",
+                    desc=response.request.url.host + "->" + filename,
+                ) as pbar,
+            ):
+                async for chunk in response.aiter_bytes():
+                    file.write(chunk)
+                    written += len(chunk)
+                    pbar.update(len(chunk))
+        elif media_check_ignore or mediatype[0] == "image":
+            img = await response.aread()
+            written = len(img)
+            if compression and mediatype[1] in ["jpeg", "png"]:
+                logger.info(f"压缩: {url} {mediatype[1]}")
+                if is_thumbnail:
+                    img = compress(BytesIO(img), size=320, format="JPEG").getvalue()
+                else:
+                    img = compress(BytesIO(img)).getvalue()
+            with temp_media.open("wb") as file:
+                file.write(img)
+        else:
+            raise ValueError(f"媒体文件类型错误: {mediatype} {url}->{referer}")
+        if total and written < total:
+            raise IncompleteDownload(f"下载不完整: {written}/{total} 字节 {url}->{referer}")
 
 
 async def handle_dash_media(
@@ -175,6 +209,26 @@ async def handle_dash_media(
                 item.unlink(missing_ok=True)
 
 
+async def handle_fallback_media(
+    f: ParsedContent,
+    client: httpx.AsyncClient,
+    cache_lookup: CacheLookup | None = None,
+):
+    """DASH 合并失败时回退到 MP4 直链，避免只剩文本输出"""
+    if not f.media or not f.media.fallback_url:
+        return []
+    filename = get_filename(f.media.fallback_url)
+    media = await get_media(client, f.url, f.media.fallback_url, filename, cache_lookup=cache_lookup)
+    if not media:
+        return []
+    f.media.urls = [f.media.fallback_url]
+    f.media.filenames = [filename]
+    f.media.merge_streams = False
+    f.media.need_download = False
+    logger.info(f"已回退 MP4 直链: {f.url}")
+    return [media]
+
+
 async def get_media_for_content(
     f: ParsedContent,
     compression: bool = True,
@@ -215,6 +269,8 @@ async def get_media_for_content(
         if f.media.merge_streams:
             # DASH 多轨流必须下载后合并，无论是否 local 模式
             media = await handle_dash_media(f, client, cache_lookup=cache_lookup)
+            if not media:
+                media = await handle_fallback_media(f, client, cache_lookup=cache_lookup)
             if media:
                 return media, mediathumb
         elif f.media.need_download or LOCAL_MODE:
