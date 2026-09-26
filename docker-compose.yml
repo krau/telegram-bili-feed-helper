@@ -32,7 +32,8 @@ services:
       - internal_network
 
   telegram-bili-feed-helper:
-    image: ghcr.io/simonsmh/telegram-bili-feed-helper:master
+    # 由本仓库 Actions 构建并发布到仓库所属账号
+    image: ghcr.io/krau/telegram-bili-feed-helper:master
     depends_on:
       - redis
       - postgres
