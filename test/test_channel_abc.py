@@ -1,7 +1,5 @@
 """测试 channel 层 — Channel ABC、TelegramChannel"""
 
-import os
-
 import pytest
 
 from biliparser.channel import Channel
@@ -63,25 +61,10 @@ class TestTelegramChannel:
 
         ch = TelegramChannel()
         mc = ch.media_constraints
-        assert mc.max_upload_size == 50 * 1024 * 1024
+        assert mc.max_upload_size == 2 * 1024 * 1024 * 1024
         assert mc.caption_max_length == 1024
-        assert mc.local_mode is False
-
-    def test_media_constraints_local_mode(self):
-        from biliparser.channel.telegram import TelegramChannel
-
-        old = os.environ.get("LOCAL_MODE")
-        os.environ["LOCAL_MODE"] = "1"
-        try:
-            ch = TelegramChannel()
-            mc = ch.media_constraints
-            assert mc.local_mode is True
-            assert mc.max_upload_size == 2 * 1024 * 1024 * 1024
-        finally:
-            if old is None:
-                os.environ.pop("LOCAL_MODE", None)
-            else:
-                os.environ["LOCAL_MODE"] = old
+        # MTProto 必须先把媒体下载到本地再上传
+        assert mc.force_download is True
 
     @pytest.mark.asyncio
     async def test_get_cached_media_returns_none_without_db(self):

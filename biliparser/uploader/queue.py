@@ -264,6 +264,7 @@ class UploadQueueManager(ABC):
                     compression=not is_fetch_task,
                     media_check_ignore=is_fetch_task,
                     no_media=is_fetch_task and task.fetch_mode == "cover",
+                    force_download=self.constraints.force_download,
                     cache_lookup=self._cache_lookup,
                 )
 

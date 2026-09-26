@@ -1,5 +1,3 @@
-import os
-
 from ...model import MediaConstraints, ParsedContent
 from ...model import PreparedMedia as PreparedMedia
 from ...provider import ProviderRegistry
@@ -8,23 +6,22 @@ from ...utils import logger
 from .. import Channel
 from .formatting import format_caption_for_telegram
 
-TELEGRAM_UPLOAD_SIZE = 50 * 1024 * 1024
-TELEGRAM_UPLOAD_SIZE_LOCAL = 2 * 1024 * 1024 * 1024
+# MTProto 单文件上限（非 Premium bot 为 2GB）
+TELEGRAM_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024
 TELEGRAM_CAPTION_LENGTH = 1024
 
 
 class TelegramChannel(Channel):
     def __init__(self):
-        self._local_mode = bool(os.environ.get("LOCAL_MODE", False))
         self._registry: ProviderRegistry | None = None
 
     @property
     def media_constraints(self) -> MediaConstraints:
         return MediaConstraints(
-            max_upload_size=(TELEGRAM_UPLOAD_SIZE_LOCAL if self._local_mode else TELEGRAM_UPLOAD_SIZE),
-            max_download_size=TELEGRAM_UPLOAD_SIZE_LOCAL,
+            max_upload_size=TELEGRAM_UPLOAD_SIZE,
+            max_download_size=TELEGRAM_UPLOAD_SIZE,
             caption_max_length=TELEGRAM_CAPTION_LENGTH,
-            local_mode=self._local_mode,
+            force_download=True,
         )
 
     def format_caption(self, content: ParsedContent) -> str:

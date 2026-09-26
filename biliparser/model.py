@@ -37,9 +37,10 @@ class MediaConstraints:
     """Channel 声明自己的媒体能力，传给 Provider"""
 
     max_upload_size: int  # bytes
-    max_download_size: int  # bytes
+    max_download_size: int
     caption_max_length: int
-    local_mode: bool = False
+    # 通道无法让平台自行抓取远程 URL 时必须先下载（如 MTProto 发送）
+    force_download: bool = False
 
 
 @dataclass

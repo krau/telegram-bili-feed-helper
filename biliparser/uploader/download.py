@@ -25,7 +25,6 @@ from ..provider.bilibili.api import BILIBILI_DESKTOP_HEADER, CACHES_TIMER, refer
 from ..utils import compress, get_filename, logger
 
 LOCAL_MEDIA_FILE_PATH = Path(os.environ.get("LOCAL_TEMP_FILE_PATH", str(Path.cwd()))) / ".tmp"
-LOCAL_MODE = bool(os.environ.get("LOCAL_MODE", False))
 
 MEDIA_DOWNLOAD_ATTEMPTS = 2
 
@@ -234,6 +233,7 @@ async def get_media_for_content(
     compression: bool = True,
     media_check_ignore: bool = False,
     no_media: bool = False,
+    force_download: bool = False,
     cache_lookup: CacheLookup | None = None,
 ) -> tuple[list, Path | str | None]:
     """下载并准备媒体文件，返回 (media_list, thumbnail)"""
@@ -247,7 +247,7 @@ async def get_media_for_content(
     ) as client:
         mediathumb = None
         if f.media.thumbnail:
-            if f.media.need_download or LOCAL_MODE:
+            if f.media.need_download or force_download:
                 mediathumb = await get_media(
                     client,
                     f.url,
@@ -273,7 +273,7 @@ async def get_media_for_content(
                 media = await handle_fallback_media(f, client, cache_lookup=cache_lookup)
             if media:
                 return media, mediathumb
-        elif f.media.need_download or LOCAL_MODE:
+        elif f.media.need_download or force_download:
             tasks = [
                 get_media(
                     client,

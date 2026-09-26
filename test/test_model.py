@@ -64,18 +64,18 @@ def test_media_constraints():
         max_download_size=2 * 1024 * 1024 * 1024,
         caption_max_length=1024,
     )
-    assert mc.local_mode is False
+    assert mc.force_download is False
     assert mc.max_upload_size == 50 * 1024 * 1024
 
 
-def test_media_constraints_local_mode():
+def test_media_constraints_force_download():
     mc = MediaConstraints(
         max_upload_size=2 * 1024 * 1024 * 1024,
         max_download_size=2 * 1024 * 1024 * 1024,
         caption_max_length=1024,
-        local_mode=True,
+        force_download=True,
     )
-    assert mc.local_mode is True
+    assert mc.force_download is True
 
 
 def test_parsed_content_minimal():

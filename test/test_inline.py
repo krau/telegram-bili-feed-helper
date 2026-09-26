@@ -1,159 +1,186 @@
-"""测试 Telegram inline 缓存候选名、URL 回退与空 filenames。"""
+"""测试 Telegram inline 查询：URL 结果构建与 answer_inline_query 错误分支。
 
-from unittest.mock import AsyncMock
+MTProto 下 inline 结果直接引用可直链 URL，不再有 file_id 缓存结果与回退重试。
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram import (
-    InlineQueryResultCachedGif,
-    InlineQueryResultCachedVideo,
-    InlineQueryResultGif,
+from pyrogram import enums
+from pyrogram.errors import RPCError
+from pyrogram.types import (
+    InlineQueryResultAnimation,
+    InlineQueryResultArticle,
+    InlineQueryResultAudio,
     InlineQueryResultPhoto,
     InlineQueryResultVideo,
 )
-from telegram.error import BadRequest
 
 from biliparser.channel.telegram.inline import (
-    INLINE_QUERY_TIMEOUT_MESSAGE,
     answer_inline_query,
+    build_help_result,
     build_media_inline_results,
-    pad_cache_ids,
-    video_cache_candidate_names,
 )
 from biliparser.model import Author, MediaInfo, ParsedContent
+from biliparser.provider.bilibili.api import referer_url
+
+CONTENT_URL = "https://www.bilibili.com/video/BVxxx"
 
 
-def test_video_cache_candidate_names_with_merge_streams():
-    assert video_cache_candidate_names(["CID-1-30080.m4s"], True) == [
-        "CID-1-30080.m4s",
-        "CID-1-30080_merged.mp4",
-    ]
+def _content(media: MediaInfo | None) -> ParsedContent:
+    return ParsedContent(url=CONTENT_URL, author=Author(name="author"), content="hi", media=media)
 
 
-def test_video_cache_candidate_names_without_merge_streams():
-    assert video_cache_candidate_names(["video.mp4"], False) == ["video.mp4"]
+# ---------------------------------------------------------------------------
+# build_media_inline_results
+# ---------------------------------------------------------------------------
 
 
-def test_video_cache_candidate_names_empty():
-    assert video_cache_candidate_names([], True) == []
+@pytest.mark.asyncio
+async def test_media_none_returns_empty_list():
+    assert build_media_inline_results(_content(None), "caption") == []
 
 
-def test_pad_cache_ids_empty_filenames():
+def test_video_result_uses_fallback_url():
+    media = MediaInfo(
+        urls=["https://cdn.invalid/v.m4s", "https://cdn.invalid/a.m4s"],
+        type="video",
+        merge_streams=True,
+        title="title",
+        fallback_url="https://cdn.invalid/v.mp4",
+        thumbnail="https://cdn.invalid/t.jpg",
+        duration=42,
+        dimension={"width": 1920, "height": 1080},
+    )
+
+    results = build_media_inline_results(_content(media), "caption")
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, InlineQueryResultVideo)
+    assert result.video_url == referer_url(media.fallback_url, CONTENT_URL)
+    assert result.thumb_url == media.thumbnail
+    assert result.title == "title"
+    assert result.mime_type == "video/mp4"
+    assert result.video_duration == 42
+    assert result.video_width == 1920
+    assert result.video_height == 1080
+    assert result.caption == "caption"
+    assert result.parse_mode == enums.ParseMode.HTML
+
+
+def test_video_result_without_fallback_uses_first_url():
+    media = MediaInfo(urls=["https://cdn.invalid/v.m4s"], type="video", title="title")
+
+    result = build_media_inline_results(_content(media), "caption")[0]
+
+    assert isinstance(result, InlineQueryResultVideo)
+    assert result.video_url == referer_url(media.urls[0], CONTENT_URL)
+
+
+def test_audio_result():
+    media = MediaInfo(urls=["https://cdn.invalid/a.m4s"], type="audio", title="song", duration=30)
+
+    results = build_media_inline_results(_content(media), "caption")
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, InlineQueryResultAudio)
+    assert result.audio_url == referer_url(media.urls[0], CONTENT_URL)
+    assert result.title == "song"
+    assert result.performer == "author"
+    assert result.audio_duration == 30
+    assert result.parse_mode == enums.ParseMode.HTML
+
+
+def test_image_results_append_size_suffixes():
     urls = ["https://i.example.com/1.jpg", "https://i.example.com/2.jpg"]
-    assert pad_cache_ids(urls, []) == [None, None]
+    media = MediaInfo(urls=urls, type="image")
+
+    results = build_media_inline_results(_content(media), "caption")
+
+    assert len(results) == 2
+    for url, result in zip(urls, results, strict=True):
+        assert isinstance(result, InlineQueryResultPhoto)
+        assert result.photo_url == f"{url}@1280w.jpg"
+        assert result.thumb_url == f"{url}@512w_512h.jpg"
+        assert result.caption == "caption"
+        assert result.parse_mode == enums.ParseMode.HTML
+
+
+def test_gif_url_becomes_animation():
+    url = "https://i.example.com/a.gif"
+    media = MediaInfo(urls=[url], type="image")
+
+    results = build_media_inline_results(_content(media), "caption")
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, InlineQueryResultAnimation)
+    assert result.animation_url == url
+    assert result.thumb_url == url
+    assert result.parse_mode == enums.ParseMode.HTML
+
+
+def test_inline_result_ids_are_unique():
+    media = MediaInfo(urls=["https://i.example.com/1.jpg", "https://i.example.com/2.jpg"], type="image")
+
+    results = build_media_inline_results(_content(media), "caption")
+
+    assert len({result.id for result in results}) == 2
+
+
+# ---------------------------------------------------------------------------
+# build_help_result
+# ---------------------------------------------------------------------------
+
+
+def test_build_help_result_embeds_description_and_markup():
+    markup = MagicMock()
+
+    result = build_help_result("描述文本", markup)
+
+    assert isinstance(result, InlineQueryResultArticle)
+    assert result.title == "帮助"
+    assert result.reply_markup is markup
+    assert result.input_message_content.message_text == "描述文本"
+    assert result.input_message_content.parse_mode == enums.ParseMode.HTML
+
+
+# ---------------------------------------------------------------------------
+# answer_inline_query
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_answer_inline_retries_fallback_on_bad_cached_file_id():
-    inline_query = AsyncMock()
-    inline_query.answer = AsyncMock(side_effect=[BadRequest("Wrong file identifier/HTTP URL specified"), None])
-    primary = [object()]
-    fallback = [object()]
+async def test_answer_inline_query_passes_results():
+    client = MagicMock()
+    client.answer_inline_query = AsyncMock()
+    inline_query = SimpleNamespace(id="query-id")
+    results = [SimpleNamespace(id="a")]
 
-    await answer_inline_query(inline_query, primary, fallback=fallback)
+    await answer_inline_query(client, inline_query, results)
 
-    assert inline_query.answer.await_count == 2
-    assert inline_query.answer.await_args_list[0].args[0] is primary
-    assert inline_query.answer.await_args_list[1].args[0] is fallback
+    client.answer_inline_query.assert_awaited_once_with("query-id", results, cache_time=0, is_personal=True)
 
 
 @pytest.mark.asyncio
-async def test_answer_inline_timeout_does_not_retry():
-    inline_query = AsyncMock()
-    inline_query.answer = AsyncMock(side_effect=BadRequest(INLINE_QUERY_TIMEOUT_MESSAGE))
-    fallback = [object()]
+async def test_answer_inline_query_expired_only_logs():
+    client = MagicMock()
+    client.answer_inline_query = AsyncMock(side_effect=RPCError("QUERY_ID_INVALID: query is too old"))
+    inline_query = SimpleNamespace(id="query-id")
 
-    await answer_inline_query(inline_query, [object()], fallback=fallback)
+    await answer_inline_query(client, inline_query, [object()])
 
-    assert inline_query.answer.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_answer_inline_fallback_failure_reraises():
-    inline_query = AsyncMock()
-    inline_query.answer = AsyncMock(
-        side_effect=[
-            BadRequest("Wrong file identifier/HTTP URL specified"),
-            BadRequest("another bad request"),
-        ]
-    )
-
-    with pytest.raises(BadRequest, match="another bad request"):
-        await answer_inline_query(inline_query, [object()], fallback=[object()])
+    client.answer_inline_query.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_empty_filenames_still_produce_url_photo_results():
-    content = ParsedContent(
-        url="https://example.com/opus",
-        author=Author(name="author"),
-        content="hi",
-        media=MediaInfo(
-            urls=["https://i.example.com/1.jpg", "https://i.example.com/2.jpg"],
-            type="image",
-            filenames=[],
-        ),
-    )
+async def test_answer_inline_query_other_rpc_error_reraises():
+    client = MagicMock()
+    client.answer_inline_query = AsyncMock(side_effect=RPCError("FLOOD_WAIT_5"))
+    inline_query = SimpleNamespace(id="query-id")
 
-    primary, fallback = await build_media_inline_results(content, "caption")
-
-    assert len(primary) == 2
-    assert len(fallback) == 2
-    assert all(isinstance(item, InlineQueryResultPhoto) for item in primary)
-    assert all(isinstance(item, InlineQueryResultPhoto) for item in fallback)
-
-
-@pytest.mark.asyncio
-async def test_gif_cache_hit_prefers_cached_gif_with_url_fallback(monkeypatch):
-    monkeypatch.setattr(
-        "biliparser.channel.telegram.inline.get_cached_media_file_id",
-        AsyncMock(return_value="gif-file-id"),
-    )
-    content = ParsedContent(
-        url="https://example.com/opus",
-        author=Author(name="author"),
-        content="hi",
-        media=MediaInfo(
-            urls=["https://i.example.com/a.gif"],
-            type="image",
-            filenames=["a.gif"],
-        ),
-    )
-
-    primary, fallback = await build_media_inline_results(content, "caption")
-
-    assert len(primary) == 1
-    assert isinstance(primary[0], InlineQueryResultCachedGif)
-    assert isinstance(fallback[0], InlineQueryResultGif)
-
-
-@pytest.mark.asyncio
-async def test_video_inline_looks_up_merged_cache_name(monkeypatch):
-    looked_up: list[str] = []
-
-    async def fake_get(name: str):
-        looked_up.append(name)
-        if name.endswith("_merged.mp4"):
-            return "file-id-merged"
-        return None
-
-    monkeypatch.setattr("biliparser.channel.telegram.inline.get_cached_media_file_id", fake_get)
-    content = ParsedContent(
-        url="https://www.bilibili.com/video/BVxxx",
-        author=Author(name="author"),
-        content="hi",
-        media=MediaInfo(
-            urls=["https://cdn.invalid/v.m4s", "https://cdn.invalid/a.m4s"],
-            type="video",
-            filenames=["CID-1-30080.m4s", "audio.m4s"],
-            merge_streams=True,
-            title="title",
-            fallback_url="https://cdn.invalid/v.mp4",
-            thumbnail="https://cdn.invalid/t.jpg",
-        ),
-    )
-
-    primary, fallback = await build_media_inline_results(content, "caption")
-
-    assert looked_up == ["CID-1-30080.m4s", "CID-1-30080_merged.mp4"]
-    assert isinstance(primary[0], InlineQueryResultCachedVideo)
-    assert isinstance(fallback[0], InlineQueryResultVideo)
+    with pytest.raises(RPCError, match="FLOOD_WAIT_5"):
+        await answer_inline_query(client, inline_query, [object()])

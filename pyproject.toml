@@ -11,7 +11,6 @@ dependencies = [
     "loguru",
     "lxml",
     "pillow",
-    "python-telegram-bot[all]",
     "redis",
     "telegraph[aio]",
     "tortoise-orm[accel]",
@@ -21,6 +20,7 @@ dependencies = [
     "orjson",
     "httpx[http2]",
     "discord-py>=2.3",
+    "kurigram>=2.2.26",
 ]
 name = "telegram-bili-feed-helper"
 version = "0.1.0"

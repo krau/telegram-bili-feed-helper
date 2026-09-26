@@ -228,3 +228,24 @@ async def test_dash_failure_without_fallback_yields_no_media(monkeypatch):
     media, _thumb = await download_module.get_media_for_content(content)
 
     assert media == []
+
+
+@pytest.mark.asyncio
+async def test_force_download_bypasses_referer_url(monkeypatch, tmp_path):
+    """force_download=True 时即使 need_download 为假也必须真实下载"""
+    monkeypatch.setattr(download_module, "LOCAL_MEDIA_FILE_PATH", tmp_path)
+    content = ParsedContent(
+        url="https://www.bilibili.com/video/BV-force",
+        author=Author(),
+        media=MediaInfo(urls=["https://cdn.invalid/v.mp4"], type="video", filenames=["v.mp4"]),
+    )
+    get_media = AsyncMock(return_value=tmp_path / "v.mp4")
+    monkeypatch.setattr(download_module, "get_media", get_media)
+
+    _, _thumb = await download_module.get_media_for_content(content)
+    get_media.assert_not_awaited()
+
+    media, _thumb = await download_module.get_media_for_content(content, force_download=True)
+
+    get_media.assert_awaited_once()
+    assert media == [tmp_path / "v.mp4"]

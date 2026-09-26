@@ -1,30 +1,74 @@
+"""Telegram caption 格式化（HTML 解析模式）
+
+Provider 的 extra_markdown / content_markdown 按 MarkdownV2 转义（历史约定），
+这里还原为纯文本再转成 HTML；其余字段本身是纯文本，直接转义。
+"""
+
+import html
 import re
 
 from ...model import Comment, MediaConstraints, ParsedContent
-from ...utils import escape_markdown
+
+# 与 utils.escape_markdown 的转义字符集保持一致
+_ESCAPE_RE = re.compile(r"\\([_*\[\]()~`>#+\-=|{}.!\\])")
+_LINK_RE = re.compile(r"\[((?:\\.|[^\]\\])*)\]\(((?:\\.|[^)\\])*)\)")
+_BLOCK_OPEN = "**>"
+_BLOCK_CLOSE = "||"
 
 
-def _clean_cn_tag_style(content: str) -> str:
-    """Refine cn tag style display: #abc# -> #abc"""
-    if not content:
+def escape_html(text: str) -> str:
+    """HTML 解析模式下的文本转义"""
+    return html.escape(text) if text else ""
+
+
+def _unescape(text: str) -> str:
+    return _ESCAPE_RE.sub(r"\1", text)
+
+
+def _inline_html(text: str) -> str:
+    """链接转 <a> 标签，其余部分剥离 MarkdownV2 转义后做 HTML 转义"""
+    parts: list[str] = []
+    pos = 0
+    for match in _LINK_RE.finditer(text):
+        parts.append(escape_html(_unescape(text[pos : match.start()])))
+        label = escape_html(_unescape(match.group(1)))
+        url = html.escape(_unescape(match.group(2)), quote=True)
+        parts.append(f'<a href="{url}">{label}</a>')
+        pos = match.end()
+    parts.append(escape_html(_unescape(text[pos:])))
+    return "".join(parts)
+
+
+def markdown_v2_to_html(text: str) -> str:
+    """Provider 的 MarkdownV2 字符串转 HTML，含 **>...|| 折叠引用块"""
+    if not text:
         return ""
-    return re.sub(r"\\#((?:(?!\\#).)+)\\#", r"\\#\1 ", content)
+    parts: list[str] = []
+    rest = text
+    while _BLOCK_OPEN in rest:
+        head, _, tail = rest.partition(_BLOCK_OPEN)
+        block, _, rest = tail.partition(_BLOCK_CLOSE)
+        # MarkdownV2 的行首 ">" 只是引用标记，HTML 用 blockquote 实体表达
+        lines = [line.removeprefix(">") for line in block.split("\n")]
+        parts.append(_inline_html(head))
+        quoted = _inline_html("\n".join(lines))
+        parts.append(f"<blockquote expandable><spoiler>{quoted}</spoiler></blockquote>")
+    parts.append(_inline_html(rest))
+    return "".join(parts)
 
 
-def _make_user_markdown(name: str, uid: str) -> str:
+def _user_html(name: str, uid: str) -> str:
     if name and uid:
-        return f"[@{escape_markdown(name)}](https://space.bilibili.com/{uid})"
+        return f'<a href="https://space.bilibili.com/{uid}">@{escape_html(name)}</a>'
     return ""
 
 
-def _format_comment_markdown(comments: list[Comment]) -> str:
+def _format_comment_html(comments: list[Comment]) -> str:
     result = ""
     for c in comments:
-        user_md = _make_user_markdown(c.author.name, c.author.uid)
-        if c.is_target:
-            result += f"💬\\> {user_md}:\n{escape_markdown(c.text)}\n"
-        elif c.is_top:
-            result += f"🔝\\> {user_md}:\n{escape_markdown(c.text)}\n"
+        user = _user_html(c.author.name, c.author.uid)
+        prefix = "💬" if c.is_target else "🔝"
+        result += f"{prefix}&gt; {user}:\n{escape_html(c.text)}\n"
     return result
 
 
@@ -38,27 +82,27 @@ def _try_append_within_limit(components: list[str], text: str, max_len: int) -> 
     return False
 
 
+def _quote(body: str) -> str:
+    return f"\n<blockquote expandable><spoiler>{body}</spoiler></blockquote>"
+
+
 def format_caption_for_telegram(content: ParsedContent, constraints: MediaConstraints) -> str:
-    """Format ParsedContent into a Telegram MarkdownV2 caption string."""
+    """Format ParsedContent into a Telegram HTML caption string."""
     max_len = constraints.caption_max_length
 
-    components = [f"{content.extra_markdown or escape_markdown(content.url)}\n"]
+    components = [f"{markdown_v2_to_html(content.extra_markdown) or escape_html(content.url)}\n"]
 
     if content.author.name:
-        user_md = _make_user_markdown(content.author.name, content.author.uid)
-        if not _try_append_within_limit(components, f"{user_md}:", max_len):
+        user_html = _user_html(content.author.name, content.author.uid)
+        if not _try_append_within_limit(components, f"{user_html}:", max_len):
             return "".join(components)
 
-    content_md = content.content_markdown or escape_markdown(content.content)
-    if content_md and not content_md.endswith("\n"):
-        content_md += "\n"
+    body = markdown_v2_to_html(content.content_markdown) if content.content_markdown else escape_html(content.content)
+    if body and not body.endswith("\n"):
+        body += "\n"
 
-    comment_md = _format_comment_markdown(content.comments)
-
-    for text in [content_md, comment_md]:
-        if text:
-            formatted = f"\n**>{_clean_cn_tag_style(text).replace(chr(10), chr(10) + '>')}||"
-            if not _try_append_within_limit(components, formatted, max_len):
-                return "".join(components)
+    for text in [body, _format_comment_html(content.comments)]:
+        if text and not _try_append_within_limit(components, _quote(text), max_len):
+            return "".join(components)
 
     return "".join(components)

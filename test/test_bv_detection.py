@@ -1,60 +1,90 @@
-"""测试 BV 号检测链路：从 Telegram 消息文本到 URL 提取、filter 匹配、provider 路由。
+"""测试 BV 号检测链路：从 Telegram 消息文本到 URL 提取、自身转发过滤、provider 路由。
 
 验证 https://www.bilibili.com/video/BV1zvQbBkEcG?spm_id_from=... 和裸 BV1zvQbBkEcG
 都能命中处理逻辑。
 """
 
+import datetime
 import re
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram import Chat, Message, MessageEntity, Update, User
-from telegram.ext import ContextTypes, filters
+from pyrogram import enums
+from pyrogram.types import Chat, MessageOriginChannel, MessageOriginHiddenUser, MessageOriginUser, User
 
 from biliparser.channel.telegram.bot import (
     BILIBILI_URL_REGEX,
+    BotContext,
     message_to_urls,
     message_to_urls_sync,
+    parse,
 )
 from biliparser.provider import ProviderRegistry
 from biliparser.provider.bilibili import BilibiliProvider
+
+BOT_USERNAME = "testbot"
+BOT_FIRST_NAME = "TestBot"
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_message(text: str, entities=None, caption=None, caption_entities=None) -> Message:
-    """构造一个最小化的 Message mock。"""
-    chat = Chat(id=123, type="private")
-    user = User(id=456, is_bot=False, first_name="Test")
-    msg = MagicMock(spec=Message)
-    msg.text = text
-    msg.caption = caption
-    msg.entities = entities or []
-    msg.caption_entities = caption_entities or []
-    msg.chat = chat
-    msg.from_user = user
-    msg.forward_origin = None
-    msg.message_id = 1
-    return msg
+def _make_message(text: str, entities=None, caption=None, caption_entities=None) -> SimpleNamespace:
+    """构造一个最小化的 Message fake。"""
+    return SimpleNamespace(
+        text=text,
+        caption=caption,
+        entities=entities or [],
+        caption_entities=caption_entities or [],
+        chat=SimpleNamespace(id=123, type=enums.ChatType.PRIVATE),
+        from_user=SimpleNamespace(id=456, is_bot=False, first_name="Test"),
+        forward_origin=None,
+        message_id=1,
+        reply_text=AsyncMock(),
+    )
 
 
-def _make_update(message: Message) -> Update:
-    update = MagicMock(spec=Update)
-    update.message = message
-    update.channel_post = None
-    update.effective_message = message
-    return update
+def _origin_user(username: str = BOT_USERNAME, is_bot: bool = True):
+    return MessageOriginUser(
+        type=enums.MessageOriginType.USER,
+        date=datetime.datetime.now(),
+        sender_user=User(id=999, is_bot=is_bot, first_name="TestBot", username=username),
+    )
 
 
-def _make_context(bot_username="testbot", bot_first_name="TestBot") -> ContextTypes.DEFAULT_TYPE:
-    ctx = MagicMock()
-    ctx.bot = MagicMock()
-    ctx.bot.username = bot_username
-    ctx.bot.first_name = bot_first_name
-    ctx.bot.id = 999
-    return ctx
+def _origin_hidden_user(name: str):
+    return MessageOriginHiddenUser(
+        type=enums.MessageOriginType.HIDDEN_USER, date=datetime.datetime.now(), sender_user_name=name
+    )
+
+
+def _origin_channel(author_signature: str | None = None):
+    return MessageOriginChannel(
+        type=enums.MessageOriginType.CHANNEL,
+        date=datetime.datetime.now(),
+        chat=Chat(id=-100123, type=enums.ChatType.CHANNEL, title="Test Channel"),
+        message_id=1,
+        author_signature=author_signature,
+    )
+
+
+def _make_client(member_status=enums.ChatMemberStatus.MEMBER) -> MagicMock:
+    client = MagicMock()
+    client.me = SimpleNamespace(username=BOT_USERNAME, first_name=BOT_FIRST_NAME)
+    client.get_me = AsyncMock(return_value=client.me)
+    client.get_chat_member = AsyncMock(return_value=SimpleNamespace(status=member_status))
+    client.send_chat_action = AsyncMock()
+    return client
+
+
+def _make_ctx(registry=None, channel=None, queue_manager=None) -> BotContext:
+    return BotContext(
+        registry=registry if registry is not None else MagicMock(spec=ProviderRegistry),
+        channel=channel if channel is not None else MagicMock(),
+        queue_manager=queue_manager if queue_manager is not None else MagicMock(submit=AsyncMock()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,35 +124,79 @@ class TestBilibiliUrlRegex:
 
 
 # ---------------------------------------------------------------------------
-# 2. filters.Regex 匹配测试 — 模拟 Telegram 的 filter 行为
+# 2. message_to_urls 自身转发过滤测试
 # ---------------------------------------------------------------------------
 
 
-class TestTelegramFilterRegex:
-    """验证 Telegram 的 filters.Regex 能命中含 BV 号的消息。"""
+class TestForwardFiltering:
+    """验证 Bot 自己转发出去的消息不会被再次解析。"""
 
-    def setup_method(self):
-        self.regex_filter = filters.Regex(BILIBILI_URL_REGEX)
-
-    def test_full_url_matches_filter(self):
-        msg = _make_message("https://www.bilibili.com/video/BV1zvQbBkEcG?spm_id_from=333.1007.tianma.1-2-2.click")
-        update = _make_update(msg)
-        assert self.regex_filter.check_update(update)
-
-    def test_bare_bv_matches_filter(self):
+    @pytest.mark.asyncio
+    async def test_own_forward_from_bot_filtered(self):
+        client = _make_client()
         msg = _make_message("BV1zvQbBkEcG")
-        update = _make_update(msg)
-        assert self.regex_filter.check_update(update)
+        msg.forward_origin = _origin_user(username=BOT_USERNAME)
+        result_msg, urls = await message_to_urls(client, msg)
+        assert result_msg is msg
+        assert urls == []
 
-    def test_bare_bv_in_sentence_matches_filter(self):
-        msg = _make_message("看看这个 BV1zvQbBkEcG 视频")
-        update = _make_update(msg)
-        assert self.regex_filter.check_update(update)
+    @pytest.mark.asyncio
+    async def test_forward_from_other_bot_kept(self):
+        client = _make_client()
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_user(username="otherbot")
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == ["BV1zvQbBkEcG"]
 
-    def test_random_text_no_match(self):
-        msg = _make_message("hello world")
-        update = _make_update(msg)
-        assert not self.regex_filter.check_update(update)
+    @pytest.mark.asyncio
+    async def test_forward_sender_name_matching_bot_filtered(self):
+        client = _make_client()
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_hidden_user(BOT_FIRST_NAME)
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == []
+
+    @pytest.mark.asyncio
+    async def test_forward_sender_name_other_kept(self):
+        client = _make_client()
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_hidden_user("Someone Else")
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == ["BV1zvQbBkEcG"]
+
+    @pytest.mark.asyncio
+    async def test_forward_from_chat_where_bot_is_admin_filtered(self):
+        client = _make_client(member_status=enums.ChatMemberStatus.ADMINISTRATOR)
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_channel()
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == []
+        client.get_chat_member.assert_awaited_once_with(-100123, "me")
+
+    @pytest.mark.asyncio
+    async def test_forward_from_chat_where_bot_is_member_kept(self):
+        client = _make_client(member_status=enums.ChatMemberStatus.MEMBER)
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_channel()
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == ["BV1zvQbBkEcG"]
+
+    @pytest.mark.asyncio
+    async def test_forward_signature_matching_bot_filtered(self):
+        client = _make_client()
+        msg = _make_message("BV1zvQbBkEcG")
+        msg.forward_origin = _origin_channel(author_signature=BOT_FIRST_NAME)
+        _result_msg, urls = await message_to_urls(client, msg)
+        assert urls == []
+        client.get_chat_member.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_message(self):
+        client = _make_client()
+        result_msg, urls = await message_to_urls(client, None)
+        assert result_msg is None
+        assert urls == []
+        client.get_me.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -133,32 +207,28 @@ class TestTelegramFilterRegex:
 class TestMessageToUrlsSync:
     def test_extract_full_url(self):
         msg = _make_message("https://www.bilibili.com/video/BV1zvQbBkEcG?spm_id_from=333.1007.tianma.1-2-2.click")
-        urls = message_to_urls_sync(msg, "testbot", "TestBot")
+        urls = message_to_urls_sync(msg)
         assert len(urls) == 1
         assert "BV1zvQbBkEcG" in urls[0]
 
     def test_extract_bare_bv(self):
         msg = _make_message("BV1zvQbBkEcG")
-        urls = message_to_urls_sync(msg, "testbot", "TestBot")
-        assert urls == ["BV1zvQbBkEcG"]
+        assert message_to_urls_sync(msg) == ["BV1zvQbBkEcG"]
 
     def test_extract_bare_bv_in_sentence(self):
         msg = _make_message("看看这个 BV1zvQbBkEcG 视频")
-        urls = message_to_urls_sync(msg, "testbot", "TestBot")
-        assert urls == ["BV1zvQbBkEcG"]
+        assert message_to_urls_sync(msg) == ["BV1zvQbBkEcG"]
 
     def test_extract_from_entity_url(self):
         """TEXT_LINK entity 的 url 属性也应被提取。"""
-        entity = MagicMock(spec=MessageEntity)
-        entity.url = "https://www.bilibili.com/video/BV1zvQbBkEcG"
+        entity = SimpleNamespace(url="https://www.bilibili.com/video/BV1zvQbBkEcG")
         msg = _make_message("点击这里", entities=[entity])
-        urls = message_to_urls_sync(msg, "testbot", "TestBot")
+        urls = message_to_urls_sync(msg)
         assert any("BV1zvQbBkEcG" in u for u in urls)
 
     def test_no_match(self):
         msg = _make_message("hello world")
-        urls = message_to_urls_sync(msg, "testbot", "TestBot")
-        assert urls == []
+        assert message_to_urls_sync(msg) == []
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +240,8 @@ class TestMessageToUrls:
     @pytest.mark.asyncio
     async def test_extract_full_url(self):
         msg = _make_message("https://www.bilibili.com/video/BV1zvQbBkEcG?spm_id_from=333.1007.tianma.1-2-2.click")
-        update = _make_update(msg)
-        ctx = _make_context()
-        result_msg, urls = await message_to_urls(update, ctx)
+        client = _make_client()
+        result_msg, urls = await message_to_urls(client, msg)
         assert result_msg is msg
         assert len(urls) == 1
         assert "BV1zvQbBkEcG" in urls[0]
@@ -180,29 +249,17 @@ class TestMessageToUrls:
     @pytest.mark.asyncio
     async def test_extract_bare_bv(self):
         msg = _make_message("BV1zvQbBkEcG")
-        update = _make_update(msg)
-        ctx = _make_context()
-        result_msg, urls = await message_to_urls(update, ctx)
+        client = _make_client()
+        result_msg, urls = await message_to_urls(client, msg)
         assert result_msg is msg
         assert urls == ["BV1zvQbBkEcG"]
 
     @pytest.mark.asyncio
     async def test_extract_bare_bv_in_sentence(self):
         msg = _make_message("看看这个 BV1zvQbBkEcG 视频不错")
-        update = _make_update(msg)
-        ctx = _make_context()
-        _result_msg, urls = await message_to_urls(update, ctx)
+        client = _make_client()
+        _result_msg, urls = await message_to_urls(client, msg)
         assert urls == ["BV1zvQbBkEcG"]
-
-    @pytest.mark.asyncio
-    async def test_none_message(self):
-        update = MagicMock(spec=Update)
-        update.message = None
-        update.channel_post = None
-        ctx = _make_context()
-        result_msg, urls = await message_to_urls(update, ctx)
-        assert result_msg is None
-        assert urls == []
 
 
 # ---------------------------------------------------------------------------
@@ -312,94 +369,68 @@ class TestParseHandlerBareBV:
     """验证 parse handler 对裸 BV 号消息的完整处理链路。"""
 
     @pytest.mark.asyncio
-    async def test_parse_handler_receives_bare_bv(self):
+    async def test_parse_handler_receives_bare_bv(self, monkeypatch):
         """模拟一条含裸 BV 号的消息，验证 parse handler 能提取 URL 并调用 registry.parse。"""
-        from biliparser.channel.telegram.bot import parse
-
+        monkeypatch.setattr("biliparser.channel.telegram.bot.check_message_request_limit", AsyncMock(return_value=True))
+        registry = MagicMock(spec=ProviderRegistry)
+        registry.parse = AsyncMock(return_value=[])
+        ctx = _make_ctx(registry=registry)
+        client = _make_client()
         msg = _make_message("BV1zvQbBkEcG")
-        msg.reply_text = AsyncMock()
-        msg.reply_chat_action = AsyncMock()
-        update = _make_update(msg)
-        ctx = _make_context()
 
-        # mock registry 和 channel
-        mock_registry = MagicMock(spec=ProviderRegistry)
-        mock_registry.parse = AsyncMock(return_value=[])
-        mock_channel = MagicMock()
-        mock_channel.media_constraints = MagicMock()
+        await parse(ctx, client, msg)
 
-        ctx.bot_data = {
-            "provider_registry": mock_registry,
-            "telegram_channel": mock_channel,
-            "upload_queue_manager": MagicMock(),
-        }
-
-        await parse(update, ctx)
-
-        # registry.parse 应该被调用，且 urls 包含 BV1zvQbBkEcG
-        mock_registry.parse.assert_called_once()
-        call_args = mock_registry.parse.call_args
-        urls = call_args[0][0]
-        assert "BV1zvQbBkEcG" in urls
+        registry.parse.assert_awaited_once()
+        urls = registry.parse.await_args.args[0]
+        assert urls == ["BV1zvQbBkEcG"]
 
     @pytest.mark.asyncio
-    async def test_parse_handler_receives_full_url(self):
+    async def test_parse_handler_receives_full_url(self, monkeypatch):
         """模拟一条含完整 bilibili URL 的消息，验证 parse handler 能提取并调用 registry.parse。"""
-        from biliparser.channel.telegram.bot import parse
-
+        monkeypatch.setattr("biliparser.channel.telegram.bot.check_message_request_limit", AsyncMock(return_value=True))
         full_url = "https://www.bilibili.com/video/BV1zvQbBkEcG?spm_id_from=333.1007.tianma.1-2-2.click"
+        registry = MagicMock(spec=ProviderRegistry)
+        registry.parse = AsyncMock(return_value=[])
+        ctx = _make_ctx(registry=registry)
+        client = _make_client()
         msg = _make_message(full_url)
-        msg.reply_text = AsyncMock()
-        msg.reply_chat_action = AsyncMock()
-        update = _make_update(msg)
-        ctx = _make_context()
 
-        mock_registry = MagicMock(spec=ProviderRegistry)
-        mock_registry.parse = AsyncMock(return_value=[])
-        mock_channel = MagicMock()
-        mock_channel.media_constraints = MagicMock()
+        await parse(ctx, client, msg)
 
-        ctx.bot_data = {
-            "provider_registry": mock_registry,
-            "telegram_channel": mock_channel,
-            "upload_queue_manager": MagicMock(),
-        }
-
-        await parse(update, ctx)
-
-        mock_registry.parse.assert_called_once()
-        call_args = mock_registry.parse.call_args
-        urls = call_args[0][0]
+        registry.parse.assert_awaited_once()
+        urls = registry.parse.await_args.args[0]
         assert any("BV1zvQbBkEcG" in u for u in urls)
 
     @pytest.mark.asyncio
-    async def test_parse_handler_bv_in_sentence(self):
+    async def test_parse_handler_bv_in_sentence(self, monkeypatch):
         """消息文本中夹杂 BV 号也应被提取。"""
-        from biliparser.channel.telegram.bot import parse
-
+        monkeypatch.setattr("biliparser.channel.telegram.bot.check_message_request_limit", AsyncMock(return_value=True))
+        registry = MagicMock(spec=ProviderRegistry)
+        registry.parse = AsyncMock(return_value=[])
+        ctx = _make_ctx(registry=registry)
+        client = _make_client()
         msg = _make_message("看看这个 BV1zvQbBkEcG 视频")
-        msg.reply_text = AsyncMock()
-        msg.reply_chat_action = AsyncMock()
-        update = _make_update(msg)
-        ctx = _make_context()
 
-        mock_registry = MagicMock(spec=ProviderRegistry)
-        mock_registry.parse = AsyncMock(return_value=[])
-        mock_channel = MagicMock()
-        mock_channel.media_constraints = MagicMock()
+        await parse(ctx, client, msg)
 
-        ctx.bot_data = {
-            "provider_registry": mock_registry,
-            "telegram_channel": mock_channel,
-            "upload_queue_manager": MagicMock(),
-        }
+        registry.parse.assert_awaited_once()
+        urls = registry.parse.await_args.args[0]
+        assert urls == ["BV1zvQbBkEcG"]
 
-        await parse(update, ctx)
+    @pytest.mark.asyncio
+    async def test_parse_handler_does_not_queue_when_no_result(self, monkeypatch):
+        """registry.parse 返回空列表时不创建上传任务。"""
+        monkeypatch.setattr("biliparser.channel.telegram.bot.check_message_request_limit", AsyncMock(return_value=True))
+        registry = MagicMock(spec=ProviderRegistry)
+        registry.parse = AsyncMock(return_value=[])
+        queue_manager = MagicMock(submit=AsyncMock())
+        ctx = _make_ctx(registry=registry, queue_manager=queue_manager)
+        client = _make_client()
+        msg = _make_message("BV1zvQbBkEcG")
 
-        mock_registry.parse.assert_called_once()
-        call_args = mock_registry.parse.call_args
-        urls = call_args[0][0]
-        assert "BV1zvQbBkEcG" in urls
+        await parse(ctx, client, msg)
+
+        queue_manager.submit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
