@@ -58,15 +58,15 @@ def test_author_no_uid():
     assert "space.bilibili.com" not in caption
 
 
-async def test_content_wrapped_in_expandable_blockquote_and_spoiler():
-    """content 应渲染为折叠引用 + 剧透"""
+async def test_content_wrapped_in_expandable_blockquote():
+    """content 应渲染为可折叠引用，但不加剧透遮罩（详情可见）"""
     pc = ParsedContent(url="https://bilibili.com", author=Author(), content="测试内容")
     text, entities = await _parse(format_caption_for_telegram(pc, _mc()))
 
     assert "测试内容" in text
     quote = next(e for e in entities if type(e).__name__ == "MessageEntityBlockquote")
     assert quote.collapsed is True
-    assert "MessageEntitySpoiler" in _types(entities)
+    assert "MessageEntitySpoiler" not in _types(entities)
 
 
 async def test_multiline_content_stays_inside_quote():
@@ -115,6 +115,7 @@ async def test_video_desc_block_becomes_quote():
     assert "第一行\n第二行" in text
     quote = next(e for e in entities if type(e).__name__ == "MessageEntityBlockquote")
     assert quote.collapsed is True
+    assert "MessageEntitySpoiler" not in _types(entities)
 
 
 def test_with_comments():

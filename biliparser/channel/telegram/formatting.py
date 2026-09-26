@@ -52,7 +52,7 @@ def markdown_v2_to_html(text: str) -> str:
         lines = [line.removeprefix(">") for line in block.split("\n")]
         parts.append(_inline_html(head))
         quoted = _inline_html("\n".join(lines))
-        parts.append(f"<blockquote expandable><spoiler>{quoted}</spoiler></blockquote>")
+        parts.append(f"<blockquote expandable>{quoted}</blockquote>")
     parts.append(_inline_html(rest))
     return "".join(parts)
 
@@ -83,7 +83,7 @@ def _try_append_within_limit(components: list[str], text: str, max_len: int) -> 
 
 
 def _quote(body: str) -> str:
-    return f"\n<blockquote expandable><spoiler>{body}</spoiler></blockquote>"
+    return f"\n<blockquote expandable>{body}</blockquote>"
 
 
 def format_caption_for_telegram(content: ParsedContent, constraints: MediaConstraints) -> str:

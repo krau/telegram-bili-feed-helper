@@ -31,6 +31,7 @@ from pyrogram.types import (
     InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 
@@ -44,6 +45,9 @@ from .formatting import format_caption_for_telegram
 BILIBILI_SHARE_URL_REGEX = r"(?i)【.*】 https://[\w\.]*?(?:bilibili\.com|b23\.tv|bili2?2?3?3?\.cn)\S+"
 
 DOCUMENT_CACHE_PREFIX = "document:"
+
+# caption 里带链接，关闭预览避免重复展示一份卡片
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # 发送这些异常说明请求已被拒绝，重新下载媒体后重试是安全的
 _REJECTED_ERRORS = (ChatAdminRequired, ChannelPrivate, PeerIdInvalid, UserIsBlocked)
@@ -216,16 +220,17 @@ class TelegramUploadQueueManager(UploadQueueManager):
             await message.reply_text(
                 f"媒体获取失败，请稍后重试\n{task.parsed_content.url}",
                 parse_mode=enums.ParseMode.DISABLED,
+                link_preview_options=NO_PREVIEW,
             )
 
     async def _reply_caption(self, message: Message, caption: str) -> None:
         """媒体发送后单独发送 caption：失败只影响 caption，不能让媒体重发"""
         try:
-            await message.reply_text(caption, parse_mode=enums.ParseMode.HTML)
+            await message.reply_text(caption, parse_mode=enums.ParseMode.HTML, link_preview_options=NO_PREVIEW)
         except Exception as e:
             logger.error(f"caption 发送失败，改用纯文本: {e}")
             with contextlib.suppress(Exception):
-                await message.reply_text(caption, parse_mode=enums.ParseMode.DISABLED)
+                await message.reply_text(caption, parse_mode=enums.ParseMode.DISABLED, link_preview_options=NO_PREVIEW)
 
     async def _upload_media(self, task: TelegramUploadTask) -> Any:
         f = task.parsed_content

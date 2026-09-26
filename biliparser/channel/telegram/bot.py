@@ -25,6 +25,7 @@ from pyrogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Message,
     MessageOriginChannel,
     MessageOriginChat,
@@ -52,6 +53,8 @@ SOURCE_CODE_MARKUP = InlineKeyboardMarkup(
 SESSION_NAME = "bilifeedbot"
 NO_PARSE = enums.ParseMode.DISABLED
 HTML = enums.ParseMode.HTML
+# 文本里常带链接，关闭预览避免重复展示卡片
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 BOT_COMMANDS = [
     ["start", "关于本 Bot"],
@@ -107,7 +110,9 @@ def _is_admin(message: Message) -> bool:
 
 async def start(ctx: BotContext, client: Client, message: Message) -> None:
     """Send welcome/help message."""
-    await message.reply_text(await get_description(client), reply_markup=SOURCE_CODE_MARKUP, parse_mode=HTML)
+    await message.reply_text(
+        await get_description(client), reply_markup=SOURCE_CODE_MARKUP, parse_mode=HTML, link_preview_options=NO_PREVIEW
+    )
 
 
 async def login(ctx: BotContext, client: Client, message: Message) -> None:
@@ -292,12 +297,12 @@ async def parse(ctx: BotContext, client: Client, message: Message) -> None:
         if isinstance(f, Exception):
             logger.warning(f"解析错误: {f}")
             if is_parse or is_video:
-                await message.reply_text(escape_html(str(f)), parse_mode=HTML)
+                await message.reply_text(escape_html(str(f)), parse_mode=HTML, link_preview_options=NO_PREVIEW)
             continue
 
         if not f.media or not f.media.urls:
             caption = format_caption_for_telegram(f, mc)
-            await message.reply_text(caption, parse_mode=HTML)
+            await message.reply_text(caption, parse_mode=HTML, link_preview_options=NO_PREVIEW)
             continue
 
         user_id = message.from_user.id if message.from_user else message.chat.id
@@ -336,7 +341,7 @@ async def fetch(ctx: BotContext, client: Client, message: Message) -> None:
     for f in parsed_results:
         if isinstance(f, Exception):
             logger.warning(f"解析错误: {f}")
-            await message.reply_text(escape_html(str(f)), parse_mode=HTML)
+            await message.reply_text(escape_html(str(f)), parse_mode=HTML, link_preview_options=NO_PREVIEW)
             continue
 
         if not f.media or not f.media.urls:
@@ -390,7 +395,9 @@ async def inline_parse(ctx: BotContext, client: Client, inline_query: InlineQuer
                 id=uuid4().hex,
                 title="解析错误！",
                 description=str(f),
-                input_message_content=InputTextMessageContent(escape_html(str(f)), parse_mode=HTML),
+                input_message_content=InputTextMessageContent(
+                    escape_html(str(f)), parse_mode=HTML, link_preview_options=NO_PREVIEW
+                ),
             )
         ]
         await answer_inline_query(client, inline_query, results)
@@ -404,7 +411,9 @@ async def inline_parse(ctx: BotContext, client: Client, inline_query: InlineQuer
                 id=uuid4().hex,
                 title=f.author.name,
                 description=f.content,
-                input_message_content=InputTextMessageContent(caption, parse_mode=HTML),
+                input_message_content=InputTextMessageContent(
+                    caption, parse_mode=HTML, link_preview_options=NO_PREVIEW
+                ),
             )
         ]
         await answer_inline_query(client, inline_query, results)
@@ -427,7 +436,7 @@ async def clear(ctx: BotContext, client: Client, message: Message) -> None:
     mc = ctx.channel.media_constraints
     for f in await ctx.registry.parse(urls, mc):
         if isinstance(f, Exception):
-            await message.reply_text(escape_html(str(f)), parse_mode=HTML)
+            await message.reply_text(escape_html(str(f)), parse_mode=HTML, link_preview_options=NO_PREVIEW)
             continue
         for _key, value in f.cache_keys.items():
             if value:
@@ -435,6 +444,7 @@ async def clear(ctx: BotContext, client: Client, message: Message) -> None:
         await message.reply_text(
             f"清除缓存成功：{escape_html(f.url)}\n请重新获取",
             parse_mode=HTML,
+            link_preview_options=NO_PREVIEW,
         )
 
 
@@ -461,6 +471,7 @@ async def tasks(ctx: BotContext, client: Client, message: Message) -> None:
         await message.reply_text(
             "当前正在进行的任务:\n" + "\n".join(escape_html(task) for task in user_tasks),
             parse_mode=HTML,
+            link_preview_options=NO_PREVIEW,
         )
     else:
         await message.reply_text("当前没有正在进行的任务", parse_mode=NO_PARSE)
