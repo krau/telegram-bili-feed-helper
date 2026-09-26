@@ -22,7 +22,7 @@ Three-layer design: Channel → Provider → Model.
 
 - **Model** (`biliparser/model.py`): Shared data types — `MediaConstraints`, `ParsedContent`, `PreparedMedia`, `Author`, `Comment`, `MediaInfo`. All layers depend on these; models depend on nothing else.
 - **Provider** (`biliparser/provider/`): Fetches and parses content from external platforms. `ProviderRegistry` routes URLs to the right provider. `BilibiliProvider` dispatches to strategy classes in `provider/bilibili/` — `Video`, `Audio`, `Live`, `Opus`, `Read` — all inheriting from `Feed`.
-- **Channel** (`biliparser/channel/`): Delivers parsed content to users. `TelegramChannel` declares its `MediaConstraints` and handles formatting/sending. Channels depend on providers via the registry; providers never import channel code.
+- **Channel** (`biliparser/channel/`): Delivers parsed content to users. `TelegramChannel` (Kurigram/MTProto) declares its `MediaConstraints` and handles formatting/sending; `DiscordChannel` uses the same queue. Channels depend on providers via the registry; providers never import channel code.
 
 Data flow: URL → `ProviderRegistry.parse()` → strategy `.handle(constraints)` → `Feed` → `_feed_to_parsed_content()` → `ParsedContent` → Channel formats and sends.
 
@@ -35,7 +35,7 @@ Architectural constraint enforced by `test_architecture.py`: providers must not 
 
 ## Key env vars
 
-`TOKEN` (Telegram bot token, required), `DATABASE_URL`, `REDIS_URL`, `LOCAL_MODE`, `FFMPEG_PATH`, `HTTP_PROXY`. Bilibili cookies: `SESSDATA`, `BILI_JCT`, `BUVID3`, `BUVID4`, `AC_TIME_VALUE`. Full list in `stack.env`.
+`TOKEN` (Telegram bot token, required), `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` (MTProto app credentials, required), `TELEGRAM_SESSION_DIR`, `LOCAL_TEMP_FILE_PATH`, `DATABASE_URL`, `REDIS_URL`, `DISCORD_TOKEN`, `FFMPEG_PATH`, `HTTP_PROXY`. Bilibili cookies: `SESSDATA`, `BILI_JCT`, `BUVID3`, `BUVID4`, `AC_TIME_VALUE`. Full list in `stack.env`.
 
 ## Style
 

@@ -1,6 +1,6 @@
 # Telegram-Bili-Feed-Helper
 [![Require: Python 3.13](https://img.shields.io/badge/Python-3.13-blue)](https://www.python.org/)
-[![Require: python-telegram-bot >= 20](https://img.shields.io/badge/python--telegram--bot-%3E%3D%2020-blue)](https://github.com/python-telegram-bot/python-telegram-bot)
+[![Require: Kurigram](https://img.shields.io/badge/kurigram-%3E%3D%202.2-blue)](https://github.com/KurimuzonAkuma/kurigram)
 
 Telegram bot for Bili Feed Helper.
 
