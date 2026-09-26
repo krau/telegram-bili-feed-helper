@@ -6,6 +6,8 @@ TelegramUploadQueueManager: 实现 _do_upload/_do_cache/_handle_upload_error
 """
 
 import asyncio
+import contextlib
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,14 +19,26 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 from ...model import ParsedContent
 from ...storage.models import TelegramFileCache
 from ...uploader.download import cleanup_medias
-from ...uploader.queue import UploadQueueManager, UploadTask
+from ...uploader.queue import UploadPhase, UploadQueueManager, UploadTask
 from ...utils import logger
 from .formatting import format_caption_for_telegram
 
 BILIBILI_SHARE_URL_REGEX = r"(?i)【.*】 https://[\w\.]*?(?:bilibili\.com|b23\.tv|bili2?2?3?3?\.cn)\S+"
 
+# 媒体上传请求的读/写超时：本地 Bot API 模式下响应要等文件转发到 Telegram 才返回，
+# 用默认的 60 秒读超时会把已投递的媒体判定为失败并触发重发
+MEDIA_UPLOAD_TIMEOUT = float(os.environ.get("MEDIA_UPLOAD_TIMEOUT", 300))
+
+# python-telegram-bot 在这些情况下明确说明请求未发出，重试不会重复投递
+_NOT_DELIVERED_MARKERS = ("ConnectError", "ConnectTimeout", "PoolTimeout", "was *not* sent to Telegram")
 
 DOCUMENT_CACHE_PREFIX = "document:"
+
+
+def _not_delivered(err: NetworkError) -> bool:
+    """请求确定没有发出（连接失败/连接池超时）"""
+    text = str(err)
+    return any(marker in text for marker in _NOT_DELIVERED_MARKERS)
 
 
 def attachment_kind(attachment) -> str:
@@ -97,8 +111,19 @@ class TelegramUploadQueueManager(UploadQueueManager):
     async def _do_cache(self, content: ParsedContent, result: Any) -> None:
         await self._cache_upload_result(content, result)
 
-    async def _handle_upload_error(self, err: Exception, task: UploadTask, attempt: int, max_retries: int) -> bool:
-        """返回 True 表示应重试，False 表示放弃"""
+    async def _handle_upload_error(
+        self,
+        err: Exception,
+        task: UploadTask,
+        attempt: int,
+        max_retries: int,
+        phase: UploadPhase = UploadPhase.SEND,
+    ) -> bool:
+        """返回 True 表示应重试。
+
+        发送阶段只有在确定未投递时才重试：Bot API 调用非幂等，
+        超时等结果未知的错误重发会让用户收到重复的媒体。
+        """
         assert isinstance(task, TelegramUploadTask)
         f = task.parsed_content
         message = task.message
@@ -114,19 +139,45 @@ class TelegramUploadQueueManager(UploadQueueManager):
             if any(x in err.message for x in ["Topic_deleted", "Topic_closed", "Message thread not found"]):
                 return False
             logger.error(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次上传失败 (BadRequest): {err}")
+            # 请求被 Telegram 拒绝说明没有投递，丢弃缓存重新下载后重试是安全的
             if f.media:
                 f.media.need_download = True
             return True
 
         if isinstance(err, RetryAfter):
+            # 429 表示请求被拒绝，重试安全
             await asyncio.sleep(err.retry_after)
             return True
 
         if isinstance(err, NetworkError):
+            if phase is UploadPhase.SEND and not _not_delivered(err):
+                logger.error(f"任务 {task.task_id[:8]} 发送结果未知，不重试以免重复发送: {err}")
+                return False
             logger.error(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次网络错误: {err}")
             return True
 
-        return await super()._handle_upload_error(err, task, attempt, max_retries)
+        return await super()._handle_upload_error(err, task, attempt, max_retries, phase)
+
+    async def _handle_final_failure(self, task: UploadTask) -> None:
+        await super()._handle_final_failure(task)
+        assert isinstance(task, TelegramUploadTask)
+        message = task.message
+        if not message:
+            return
+        with contextlib.suppress(Exception):
+            await message.reply_text(
+                f"媒体获取失败，请稍后重试\n{task.parsed_content.url}",
+                parse_mode=None,
+            )
+
+    async def _reply_caption(self, message: Message, caption: str) -> None:
+        """媒体发送后单独发送 caption：失败只影响 caption，不能让媒体重发"""
+        try:
+            await message.reply_text(caption)
+        except Exception as e:
+            logger.error(f"caption 发送失败，改用纯文本: {e}")
+            with contextlib.suppress(Exception):
+                await message.reply_text(caption, parse_mode=None)
 
     async def _upload_media(self, task: TelegramUploadTask) -> Any:
         f = task.parsed_content
@@ -151,6 +202,8 @@ class TelegramUploadQueueManager(UploadQueueManager):
                 filename=f.media.filenames[0] if f.media.filenames else None,
                 width=f.media.dimension.get("width", 0),
                 height=f.media.dimension.get("height", 0),
+                read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                write_timeout=MEDIA_UPLOAD_TIMEOUT,
             )
         elif f.media.type == "audio":
             result = await message.reply_audio(
@@ -161,6 +214,8 @@ class TelegramUploadQueueManager(UploadQueueManager):
                 thumbnail=mediathumb,
                 title=f.media.title,
                 filename=f.media.filenames[0] if f.media.filenames else None,
+                read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                write_timeout=MEDIA_UPLOAD_TIMEOUT,
             )
         elif len(f.media.urls) == 1:
             if ".gif" in f.media.urls[0]:
@@ -168,12 +223,16 @@ class TelegramUploadQueueManager(UploadQueueManager):
                     media[0],
                     caption=caption,
                     filename=f.media.filenames[0] if f.media.filenames else None,
+                    read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                    write_timeout=MEDIA_UPLOAD_TIMEOUT,
                 )
             else:
                 result = await message.reply_photo(
                     media[0],
                     caption=caption,
                     filename=f.media.filenames[0] if f.media.filenames else None,
+                    read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                    write_timeout=MEDIA_UPLOAD_TIMEOUT,
                 )
         else:
             result = await self._upload_media_group(message, f, media, mediathumb, caption)
@@ -202,9 +261,11 @@ class TelegramUploadQueueManager(UploadQueueManager):
                     )
                     for img, mu, fn in zip(sub_media, sub_urls, sub_fns, strict=False)
                 ],
+                read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                write_timeout=MEDIA_UPLOAD_TIMEOUT,
             )
             result += sub_result
-        await message.reply_text(caption)
+        await self._reply_caption(message, caption)
         return result
 
     async def _cache_upload_result(self, f: ParsedContent, result: Any) -> None:
@@ -240,6 +301,8 @@ class TelegramUploadQueueManager(UploadQueueManager):
                     document=medias[0],
                     caption=caption,
                     filename=mediafilenames[0],
+                    read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                    write_timeout=MEDIA_UPLOAD_TIMEOUT,
                 )
                 await cache_media(mediafilenames[0], result.effective_attachment)
             else:
@@ -255,9 +318,11 @@ class TelegramUploadQueueManager(UploadQueueManager):
                 for sub_m, sub_fn in splits:
                     sub_result = await message.reply_media_group(
                         [InputMediaDocument(m, filename=fn) for m, fn in zip(sub_m, sub_fn, strict=False)],
+                        read_timeout=MEDIA_UPLOAD_TIMEOUT,
+                        write_timeout=MEDIA_UPLOAD_TIMEOUT,
                     )
                     result += sub_result
-                await message.reply_text(caption)
+                await self._reply_caption(message, caption)
                 for filename, item in zip(mediafilenames, result, strict=False):
                     await cache_media(filename, item.effective_attachment)
         except Exception as err:

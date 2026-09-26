@@ -9,6 +9,7 @@ Discord bot 实现
 - run_bot: 启动 Discord bot（async，供 __main__.py 的 asyncio.gather 调用）
 """
 
+import contextlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -111,6 +112,14 @@ class DiscordUploadQueueManager(UploadQueueManager):
 
     async def _do_cache(self, content: ParsedContent, result: Any) -> None:
         pass  # Discord CDN URL 会过期，不缓存
+
+    async def _handle_final_failure(self, task: UploadTask) -> None:
+        await super()._handle_final_failure(task)
+        assert isinstance(task, DiscordUploadTask)
+        if not task.discord_context:
+            return
+        with contextlib.suppress(discord.HTTPException):
+            await task.discord_context.message.reply("媒体获取失败，请稍后重试", mention_author=False)
 
     async def _send_content(self, task: DiscordUploadTask) -> Any:
         assert task.discord_context is not None

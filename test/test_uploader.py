@@ -113,6 +113,7 @@ async def test_telegram_upload_success_deletes_share_message(monkeypatch):
 async def test_fetch_upload_prepares_media_once_under_single_content_lock(monkeypatch):
     import biliparser.uploader.queue as queue_module
     from biliparser.channel.telegram.uploader import TelegramUploadQueueManager, TelegramUploadTask
+    from biliparser.uploader.queue import UploadResult
 
     class CountingLock:
         def __init__(self):
@@ -166,7 +167,7 @@ async def test_fetch_upload_prepares_media_once_under_single_content_lock(monkey
         constraints=_media_constraints(),
     )
 
-    assert await manager._try_upload_once(task, 1, 1)
+    assert await manager._try_upload_once(task, 1, 1) is UploadResult.SUCCESS
     assert lock.enter_count == 1
     prepare_media.assert_awaited_once()
     message.reply_document.assert_awaited_once()
@@ -251,3 +252,151 @@ async def test_cache_media_photosize_tuple_uses_largest(monkeypatch):
         mediafilename="img.jpg",
         defaults={"file_id": "large"},
     )
+
+
+# ── 重试策略：发送阶段不重发已投递的媒体 ────────────────────────────────────────
+
+
+class FakeCache:
+    """避免测试触碰真实 Redis/FakeRedis 文件"""
+
+    class FakeLock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    def lock(self, key, timeout):
+        return self.FakeLock()
+
+
+def _patch_queue(monkeypatch, media_result):
+    import biliparser.uploader.queue as queue_module
+
+    monkeypatch.setattr(queue_module, "RedisCache", FakeCache)
+    monkeypatch.setattr(queue_module, "get_media_for_content", AsyncMock(return_value=media_result))
+
+
+def _telegram_manager(monkeypatch):
+    from biliparser.channel.telegram.uploader import TelegramUploadQueueManager
+
+    monkeypatch.setattr("biliparser.channel.telegram.uploader.cache_media", AsyncMock())
+    manager = TelegramUploadQueueManager(registry=ProviderRegistry(), constraints=_media_constraints())
+    manager._try_delete_share_message = AsyncMock()
+    manager._do_cache = AsyncMock()
+    manager._retry_parse_url = AsyncMock(return_value=True)
+    return manager
+
+
+def _fake_message():
+    message = MagicMock()
+    for name in [
+        "reply_text",
+        "reply_video",
+        "reply_audio",
+        "reply_photo",
+        "reply_animation",
+        "reply_media_group",
+        "reply_document",
+    ]:
+        setattr(message, name, AsyncMock(return_value=MagicMock(effective_attachment=object())))
+    message.reply_media_group.return_value = (MagicMock(effective_attachment=object()),)
+    return message
+
+
+def _telegram_task(message, url, media=None, task_type="parse", fetch_mode=None):
+    from biliparser.channel.telegram.uploader import TelegramUploadTask
+
+    return TelegramUploadTask(
+        user_id=1,
+        context=message,
+        message=message,
+        parsed_content=ParsedContent(url=url, author=Author(), media=media),
+        media=[],
+        mediathumb=None,
+        urls=[url],
+        task_type=task_type,
+        fetch_mode=fetch_mode,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_timeout_is_not_retried(monkeypatch):
+    """发送结果未知（超时）时不得重发，只通知用户"""
+    from telegram.error import TimedOut
+
+    message = _fake_message()
+    media = MediaInfo(urls=["https://cdn.invalid/v.mp4"], type="video", filenames=["v.mp4"])
+    task = _telegram_task(message, "https://www.bilibili.com/video/av2", media=media)
+    _patch_queue(monkeypatch, ([Path("/tmp/v.mp4")], None))
+    manager = _telegram_manager(monkeypatch)
+    message.reply_video.side_effect = TimedOut("Timed out")
+
+    manager.active_tasks[1] = {task.task_id: task}
+    await manager._process_upload(task)
+
+    message.reply_video.assert_awaited_once()
+    notice = message.reply_text.await_args
+    assert "媒体获取失败" in notice.args[0]
+    assert notice.kwargs["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_connect_error_is_retried(monkeypatch):
+    """确定未发出的连接错误仍可重试"""
+    from telegram.error import NetworkError
+
+    message = _fake_message()
+    media = MediaInfo(urls=["https://cdn.invalid/v.mp4"], type="video", filenames=["v.mp4"])
+    task = _telegram_task(message, "https://www.bilibili.com/video/av3", media=media)
+    _patch_queue(monkeypatch, ([Path("/tmp/v.mp4")], None))
+    manager = _telegram_manager(monkeypatch)
+    calls = {"n": 0}
+
+    async def reply_video(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise NetworkError("httpx.ConnectError: connection failed")
+        return MagicMock(effective_attachment=object())
+
+    message.reply_video.side_effect = reply_video
+
+    manager.active_tasks[1] = {task.task_id: task}
+    await manager._process_upload(task)
+
+    assert calls["n"] == 2
+    message.reply_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_caption_failure_does_not_resend_media_group(monkeypatch):
+    """caption 是独立消息，它的失败不能让媒体组重发"""
+    from telegram.error import BadRequest
+
+    message = _fake_message()
+    media = MediaInfo(
+        urls=["https://cdn.invalid/1.jpg", "https://cdn.invalid/2.jpg"],
+        type="image",
+        filenames=["1.jpg", "2.jpg"],
+    )
+    task = _telegram_task(message, "https://www.bilibili.com/opus/1", media=media)
+    _patch_queue(monkeypatch, ([Path("/tmp/1.jpg"), Path("/tmp/2.jpg")], None))
+    manager = _telegram_manager(monkeypatch)
+
+    captions = {"n": 0}
+
+    async def reply_text(text, **kwargs):
+        captions["n"] += 1
+        if captions["n"] == 1:
+            raise BadRequest("Can't parse entities")
+        assert kwargs.get("parse_mode") is None
+        return MagicMock()
+
+    message.reply_text.side_effect = reply_text
+
+    manager.active_tasks[1] = {task.task_id: task}
+    await manager._process_upload(task)
+
+    message.reply_media_group.assert_awaited_once()
+    assert captions["n"] == 2

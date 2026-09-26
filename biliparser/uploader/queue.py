@@ -8,6 +8,7 @@ UploadQueueManager: 抽象基类，提供队列/worker/重试骨架，平台相�
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -36,6 +37,21 @@ class UploadTask:
     fetch_mode: str | None = None
     task_id: str = field(default_factory=lambda: uuid4().hex)
     cancelled: bool = False
+
+
+class UploadPhase(str, Enum):
+    """失败发生的阶段 — 决定重试是否安全"""
+
+    PREPARE = "prepare"  # 媒体准备（下载/合并），尚未发送，重试安全
+    SEND = "send"  # 平台发送，可能已投递，重试会导致重复
+
+
+class UploadResult(Enum):
+    """单次上传尝试的结果"""
+
+    SUCCESS = "success"
+    RETRY = "retry"
+    GIVE_UP = "give_up"
 
 
 class UploadQueueManager(ABC):
@@ -77,13 +93,31 @@ class UploadQueueManager(ABC):
 
     # ── 可 override 的错误处理 ────────────────────────────────────────────────
 
-    async def _handle_upload_error(self, err: Exception, task: UploadTask, attempt: int, max_retries: int) -> bool:
-        """处理上传错误，返回 True 表示应重试，False 表示放弃。子类可 override 处理平台特定异常。"""
+    async def _handle_upload_error(
+        self,
+        err: Exception,
+        task: UploadTask,
+        attempt: int,
+        max_retries: int,
+        phase: UploadPhase = UploadPhase.SEND,
+    ) -> bool:
+        """处理上传错误，返回 True 表示应重试。子类可 override 处理平台特定异常。
+
+        phase 为 PREPARE 时尚未发生任何发送，重试安全；
+        为 SEND 时请求可能已经投递，平台接口不具备幂等性，只能在确定未投递时返回 True。
+        """
         if isinstance(err, httpx.HTTPError):
             logger.error(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次网络错误: {err}")
             return True
+        if phase is UploadPhase.PREPARE:
+            logger.exception(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次媒体准备失败: {err}")
+            return True
         logger.exception(f"任务 {task.task_id[:8]} 第 {attempt}/{max_retries} 次未预期异常: {err}")
         return False
+
+    async def _handle_final_failure(self, task: UploadTask) -> None:
+        """任务在无法继续重试后失败，子类可 override 通知用户。"""
+        logger.error(f"任务 {task.task_id[:8]} 最终失败: {task.parsed_content.url}")
 
     # ── 队列管理 ──────────────────────────────────────────────────────────────
 
@@ -189,11 +223,14 @@ class UploadQueueManager(ABC):
             async with self._lock:
                 if task.task_id not in self.active_tasks.get(task.user_id, {}):
                     return
-            success = await self._try_upload_once(task, attempt, MAX_RETRIES)
-            if success:
+            result = await self._try_upload_once(task, attempt, MAX_RETRIES)
+            if result is UploadResult.SUCCESS:
                 return
-            if attempt < MAX_RETRIES and not await self._retry_parse_url(task):
+            if result is UploadResult.GIVE_UP:
                 break
+            if attempt >= MAX_RETRIES or not await self._retry_parse_url(task):
+                break
+        await self._handle_final_failure(task)
 
     async def _retry_parse_url(self, task: UploadTask) -> bool:
         """重新解析 URL，使用构造时注入的 registry"""
@@ -209,9 +246,11 @@ class UploadQueueManager(ABC):
             logger.exception(f"任务 {task.task_id[:8]} 重新解析时发生异常: {e}")
             return False
 
-    async def _try_upload_once(self, task: UploadTask, attempt: int, max_retries: int) -> bool:
+    async def _try_upload_once(self, task: UploadTask, attempt: int, max_retries: int) -> UploadResult:
+        """执行一次「媒体准备 + 发送」，失败由 _handle_upload_error 决定是否重试。"""
         f = task.parsed_content
         medias: list[Path | str] = []
+        phase = UploadPhase.PREPARE
         try:
             async with RedisCache().lock(f.url, timeout=2 * CACHES_TIMER["LOCK"]):
                 is_fetch_task = task.task_type == "fetch"
@@ -236,15 +275,16 @@ class UploadQueueManager(ABC):
                 if isinstance(mediathumb, Path):
                     medias.append(mediathumb)
 
+                phase = UploadPhase.SEND
                 result = await self._do_upload(task)
                 if result is not None:
                     await self._do_cache(f, result)
                 logger.info(f"任务 {task.task_id[:8]} 上传成功 (尝试 {attempt}/{max_retries})")
-                return True
+                return UploadResult.SUCCESS
 
         except Exception as err:
-            should_retry = await self._handle_upload_error(err, task, attempt, max_retries)
-            return not should_retry
+            should_retry = await self._handle_upload_error(err, task, attempt, max_retries, phase)
+            return UploadResult.RETRY if should_retry else UploadResult.GIVE_UP
         finally:
             cleanup_medias(medias)
 
